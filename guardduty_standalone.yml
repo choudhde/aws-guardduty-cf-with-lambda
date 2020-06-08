@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Enable AWS GuardDuty. This template enables GuardDuty on a Standalone account.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Principal Service
+        Parameters:
+          - Service
+      - Label:
+          default: GuardDuty-IPSet 
+        Parameters:
+          - GuardDutyIPSet
+          - GuardDutyIPSetS3Bucket
+      - Label:
+          default: Tags
+        Parameters:
+          - TagKey
+          - TagValue
+
+    ParameterLabels:
+      Service:
+        default: Principal service that publishes log to S3
+      GuardDutyIPSet:
+        default: Set of trusted IPs. If set to "True", provide S3 URI with a Plaintext File containing IPs. - (Boolean)
+      GuardDutyIPSetS3Bucket:
+        default: Provide S3 URI for Trusted IP list. Leave it blank if GuardDuty-IPSet is "False"
+      TagKey:
+        default: Default Tagging - Key
+      TagValue:
+        default: Default Tagging - Value
+
+Parameters:
+  Service:
+    Type: String
+    Default: guardduty
+    Description: Principal service allowed to publish log into S3 bucket
+    AllowedValues:
+      - guardduty
+      - cloudtrail
+
+  GuardDutyIPSet:
+    Type: String
+    Default: False
+    Description: Set of trusted IP addresses from which secure communication is allowed
+    AllowedValues:
+      - True
+      - False
+
+  GuardDutyIPSetS3Bucket:
+    Type: String
+    Default: ''
+    Description: The URI of the file that contains the IPSet in Txt format Only. Refer - https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_upload_lists.html
+
+
+  Frequency:
+    Type: String
+    Default: 6hours
+    Description: How frequently finding updates are published by AWS
+    AllowedValues:
+      - 15mins
+      - 1hour
+      - 6hours
+
+  TagKey:
+    Type: String
+    Description: Tag Key
+    
+  TagValue:
+    Type: String
+    Description: Tag Value
+
+Conditions:
+  IsGovCloud: !Equals [ us-gov-west-1, !Ref 'AWS::Region' ]
+  IsGuardDutyIPSet: !Equals
+    - !Ref GuardDutyIPSet
+    - True
+  IsGuardDutyIPSetS3Bucket: !And 
+    - !Condition IsGuardDutyIPSet
+    - !Not
+      - !Equals 
+        - !Ref GuardDutyIPSetS3Bucket
+        - ''
+
+Mappings:
+  Settings:
+    FrequencyMap:
+      15mins  : FIFTEEN_MINUTES
+      1hour  : ONE_HOUR
+      6hours  : SIX_HOURS
+
+Resources:
+  KMSKey:
+    DeletionPolicy: Retain
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub
+              - arn:${Partition}:iam::${AWS::AccountId}:root
+              - { Partition: !If [ IsGovCloud, aws-us-gov, aws ] }
+          Action: 'kms:*'
+          Resource: '*'
+        - Sid: Allow GuardDuty to encrypt findings
+          Effect: Allow
+          Principal:
+            Service: !Sub "${Service}.amazonaws.com"
+          Action: 'kms:GenerateDataKey'
+          Resource: '*'
+
+  KMSKeyAlias:
+    DeletionPolicy: Retain
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}"
+      TargetKeyId: !Ref KMSKey
+
+  Bucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                KMSMasterKeyID: !GetAtt KMSKey.Arn
+                SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+          Rules:
+            - Id: Transition90daysRetain7yrs
+              Status: Enabled
+              ExpirationInDays: 2555
+              Transition:
+                  TransitionInDays: 90
+                  StorageClass: STANDARD_IA
+      VersioningConfiguration:
+          Status: Enabled
+      Tags:
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Deny non-HTTPS access
+            Effect: Deny
+            Principal:
+              Service: !Sub "${Service}.amazonaws.com"
+            Action: 's3:*'
+            Resource: !Sub 'arn:aws:s3:::${Bucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: Allow PutObject
+            Effect: Allow
+            Principal:
+              Service: !Sub "${Service}.amazonaws.com"
+            Action: 's3:PutObject'
+            Resource: !Sub "arn:aws:s3:::${Bucket}/*"
+          - Sid: Allow GetBucketLocation
+            Effect: Allow
+            Principal:
+              Service: !Sub "${Service}.amazonaws.com"
+            Action: 's3:GetBucketLocation'
+            Resource: !Sub "arn:aws:s3:::${Bucket}"
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: !FindInMap
+        - Settings
+        - FrequencyMap
+        - !Ref Frequency
+
+  EnableGuardDutyIPSet:
+    Condition: IsGuardDutyIPSetS3Bucket
+    Type: AWS::GuardDuty::IPSet
+    Properties:
+      Activate: true
+      DetectorId: !Ref GuardDutyDetector
+      Format: "TXT"
+      Location: !Ref GuardDutyIPSetS3Bucket
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: enableGuardduty
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ['guardduty:*', 'logs:*']
+                Resource: '*'
+
+  GuardDutyExportFindingsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          awsRegion: !Sub ${AWS::Region}
+          detectorID: !Ref GuardDutyDetector
+          bucketName: !Ref Bucket
+          kmsKeyArn:  !GetAtt KMSKey.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os 
+          import json
+          import cfnresponse
+
+          DETECTOR_ID = str(os.getenv('detectorID'))
+          BUCKET_NAME = str(os.getenv('bucketName'))
+          KMS_KEY_ARN = str(os.getenv('kmsKeyArn'))
+          AWS_REGION = str(os.getenv('awsRegion'))
+          responseData = {}
+
+          def lambda_handler(event, context):
+              try:
+                  gd_client = boto3.client('guardduty', region_name=AWS_REGION)
+                  response = gd_client.create_publishing_destination(DetectorId=DETECTOR_ID,
+                                                DestinationType='S3',
+                                                DestinationProperties={
+                                                    'DestinationArn': "arn:aws:s3:::" + BUCKET_NAME,
+                                                    'KmsKeyArn': KMS_KEY_ARN
+                                                })
+                  responseData['Response'] = json.dumps(response)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as err:
+                  print("Error: {}".format(err))
+                  responseData['Response'] = json.dumps("Check logs for further details")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                  
+
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      Timeout: 20
+      Role: !GetAtt LambdaExecutionRole.Arn
+  
+  FunctionInvoke:
+    Type: Custom::GuardDutyExportFindings
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt GuardDutyExportFindingsFunction.Arn
+
+Outputs:
+  KmsArn:
+    Value: !GetAtt KMSKey.Arn
+  DetectorID:
+    Value: !Ref GuardDutyDetector
+  S3Bucket:
+    Value: !Ref Bucket
+  GuarddutyFunction:
+    Value: !GetAtt GuardDutyExportFindingsFunction.Arn
