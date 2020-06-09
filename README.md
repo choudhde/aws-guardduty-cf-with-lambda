@@ -1,4 +1,4 @@
-## aws-guardduty-cf-with-lambda
+## aws-guardduty-cloudformation-with-inline-lambda
 
 ![Guardduty](./images/guardduty.png)
 
