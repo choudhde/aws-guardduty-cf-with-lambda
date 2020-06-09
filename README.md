@@ -1,5 +1,7 @@
 ## aws-guardduty-cf-with-lambda
 
+![Guardduty](./images/guardduty.png)
+
 #### Description:  
 <p> This Cloudformation template enables Guardduty and allows publishing destination.
 Cloudformation for guardduty doesn't have resource that allows publishing to a destination natively.
